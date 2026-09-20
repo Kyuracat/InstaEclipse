@@ -27,20 +27,6 @@ import ps.reso.instaeclipse.utils.feature.FeatureStatusTracker;
 import ps.reso.instaeclipse.utils.ghost.HiddenThreads;
 import ps.reso.instaeclipse.utils.log.ModuleLog;
 
-/**
- * Hide Specific Chats: let the user hide chosen DM threads from the Direct inbox.
- *
- * Two parts:
- *  1. Inbox filter — hooks the DirectThreadStore's inbox thread-summary builder (anchored by the
- *     stable string "DirectThreadStoreImpl.getSortedCopyOfThreadSummaries") and removes rows whose
- *     thread id is in the persistent hidden set (HiddenThreads). Each row exposes a
- *     com.instagram.model.direct.DirectThreadKey; its first String field is the thread id (same
- *     resolution KeepUnsentMessagesHook/UnsentThreadButtonHook already use).
- *  2. Hide toggle — injects an eye-off button into the OPEN thread's header (same global-layout
- *     pattern as UnsentThreadButtonHook); tapping it hides/unhides the current thread.
- *
- * Gated on FeatureFlags.hideSpecificChats.
- */
 public class HideChatsHook {
 
     private static final String TAG = "ie_hidechat_btn";
@@ -53,7 +39,7 @@ public class HideChatsHook {
         installThreadTracker(bridge, classLoader);
     }
 
-    // ── 1. Inbox thread-list filter ────────────────────────────────────────────
+    // ── 1. Inbox thread-list filter (Klonlanmış Liste ile Güvenli Filtreleme) ──
     private void installInboxFilter(DexKitBridge bridge, ClassLoader classLoader) {
         XC_MethodHook filter = new XC_MethodHook() {
             @Override protected void afterHookedMethod(MethodHookParam param) {
@@ -61,10 +47,22 @@ public class HideChatsHook {
                 Object r = param.getResult();
                 if (!(r instanceof java.util.List) || ((java.util.List<?>) r).isEmpty()) return;
                 try {
-                    java.util.Iterator<?> it = ((java.util.List<?>) r).iterator();
+                    // Instagram'ın önbelleğini bozmamak için listenin klonunu alıyoruz
+                    java.util.List<Object> newList = new java.util.ArrayList<>((java.util.List<?>) r);
+                    java.util.Iterator<Object> it = newList.iterator();
+                    boolean modified = false;
+                    
                     while (it.hasNext()) {
                         String id = threadIdOfRow(it.next());
-                        if (id != null && HiddenThreads.isHidden(id)) it.remove();
+                        if (id != null && HiddenThreads.isHidden(id)) {
+                            it.remove();
+                            modified = true;
+                        }
+                    }
+                    
+                    // Sadece değişiklik yapıldıysa klonlanmış temiz listeyi geri döndür
+                    if (modified) {
+                        param.setResult(newList);
                     }
                 } catch (Throwable ignored) {}
             }
@@ -83,7 +81,6 @@ public class HideChatsHook {
         }
     }
 
-    /** Finds the DirectThreadKey on an inbox row object and returns its thread id (first String). */
     private static String threadIdOfRow(Object row) {
         if (row == null) return null;
         try {
@@ -99,7 +96,6 @@ public class HideChatsHook {
                 c = c.getSuperclass();
             }
         } catch (Throwable ignored) {}
-        // fallback: the key may sit one or two objects deeper inside the row
         try {
             Object dtk = scan(row, 0,
                     java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>()), 3);
@@ -213,18 +209,13 @@ public class HideChatsHook {
         return ps.reso.instaeclipse.utils.i18n.I18n.t(a, res);
     }
 
-    /**
-     * Best-effort title of the open thread (username, for the unhide-manager label). The
-     * thread_title id resolves but findViewById returns null here, so scan the header subtree for
-     * its TextViews and pick the @username (a handle-like token), falling back to the first name.
-     */
     private String threadTitle(Activity a) {
         try {
             View header = threadHeaderId != 0 ? a.findViewById(threadHeaderId) : null;
             if (!(header instanceof ViewGroup)) return "";
             java.util.List<String> texts = new java.util.ArrayList<>();
             collectTexts((ViewGroup) header, texts);
-            for (String t : texts) if (t.matches("[a-zA-Z0-9._]{2,30}")) return t; // handle-like
+            for (String t : texts) if (t.matches("[a-zA-Z0-9._]{2,30}")) return t;
             return texts.isEmpty() ? "" : texts.get(0);
         } catch (Throwable t) { return ""; }
     }
@@ -241,10 +232,17 @@ public class HideChatsHook {
         }
     }
 
-    // ── thread-id resolution (mirrors UnsentThreadButtonHook.resolveFromActivity — proven) ──
+    // ── thread-id resolution (Öncelik sırası Tracker'a alınarak düzeltildi) ──
     private String resolveThreadId(Activity activity) {
+        // 1. ÖNCELİK: Canlı Thread Tracker (Ekranda gerçekten aktif olan sohbet)
+        String t = trackedVisibleId;
+        if (t != null) { ModuleLog.line("(IE|HideChats) id via thread tracker"); return t; }
+        
+        t = KeepUnsentMessagesHook.currentThreadId;
+        if (t != null) { ModuleLog.line("(IE|HideChats) id via KeepUnsent tracker"); return t; }
+
+        // 2. Intent extras (Backstack sorunu yüzünden 2. plana atıldı)
         try {
-            // 1. Intent extras (thread key usually passed here); depth 4.
             android.os.Bundle ex = activity.getIntent() != null ? activity.getIntent().getExtras() : null;
             if (ex != null) {
                 for (String k : ex.keySet()) {
@@ -253,20 +251,14 @@ public class HideChatsHook {
                     if (dtk != null) { String id = firstStringField(dtk); if (id != null) return id; }
                 }
             }
-            // 2. Activity object graph (hosted thread fragment holds the key); depth 6.
+            // 3. Activity object graph
             Object dtk = scan(activity, 0,
                     java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()), 6);
             String id = dtk != null ? firstStringField(dtk) : null;
             if (id != null) { ModuleLog.line("(IE|HideChats) id via object-graph scan"); return id; }
-        } catch (Throwable t) { /* fall through to the other strategies */ }
+        } catch (Throwable ignored) {}
 
-        // 3. Open-thread tracker (hooked "igThreadIgid" (DirectThreadKey, boolean) -> void).
-        String t = trackedVisibleId;
-        if (t != null) { ModuleLog.line("(IE|HideChats) id via thread tracker"); return t; }
-        t = KeepUnsentMessagesHook.currentThreadId;
-        if (t != null) { ModuleLog.line("(IE|HideChats) id via KeepUnsent tracker"); return t; }
-
-        // 4. Wider object-graph scan (also walks androidx/fragment internals, collections, arrays).
+        // 4. Wider object-graph scan
         try {
             int[] budget = new int[]{6000};
             Object dtk = scanWide(activity, 0,
@@ -275,9 +267,10 @@ public class HideChatsHook {
             if (id != null) { ModuleLog.line("(IE|HideChats) id via wide scan"); return id; }
         } catch (Throwable ignored) {}
 
-        // 5. Last resort: the most recent thread event, whatever its flag.
+        // 5. Last resort
         t = trackedAnyId;
         if (t != null) { ModuleLog.line("(IE|HideChats) id via last thread event"); return t; }
+        
         ModuleLog.line("(IE|HideChats) ⚠️ could not identify thread (tracker events seen: " + trackerEvents + ")");
         return null;
     }
@@ -314,7 +307,6 @@ public class HideChatsHook {
         }
     }
 
-    /** Wider scan: descends androidx/X./app classes, collections, maps and arrays (bounded). */
     private static Object scanWide(Object obj, int depth, java.util.Set<Object> seen, int maxDepth, int[] budget) {
         if (obj == null || depth > maxDepth || budget[0] <= 0 || !seen.add(obj)) return null;
         budget[0]--;
@@ -364,7 +356,7 @@ public class HideChatsHook {
             }
             for (Class<?> c = oc; c != null && c != Object.class; c = c.getSuperclass()) {
                 String ccn = c.getName();
-                if (ccn.startsWith("android.") || ccn.startsWith("java.")) break; // framework base classes
+                if (ccn.startsWith("android.") || ccn.startsWith("java.")) break;
                 for (Field f : c.getDeclaredFields()) {
                     if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
                     f.setAccessible(true);
@@ -380,7 +372,6 @@ public class HideChatsHook {
         return null;
     }
 
-    /** Find a DirectThreadKey in obj's field graph (depth-limited; descends IG/obfuscated + Bundles). */
     private static Object scan(Object obj, int depth, java.util.Set<Object> seen, int maxDepth) {
         if (obj == null || depth > maxDepth || !seen.add(obj)) return null;
         String cn = obj.getClass().getName();
