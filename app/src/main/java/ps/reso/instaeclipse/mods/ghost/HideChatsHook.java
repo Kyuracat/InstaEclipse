@@ -47,7 +47,6 @@ public class HideChatsHook {
                 Object r = param.getResult();
                 if (!(r instanceof java.util.List) || ((java.util.List<?>) r).isEmpty()) return;
                 try {
-                    // Instagram'ın önbelleğini bozmamak için listenin klonunu alıyoruz
                     java.util.List<Object> newList = new java.util.ArrayList<>((java.util.List<?>) r);
                     java.util.Iterator<Object> it = newList.iterator();
                     boolean modified = false;
@@ -60,7 +59,6 @@ public class HideChatsHook {
                         }
                     }
                     
-                    // Sadece değişiklik yapıldıysa klonlanmış temiz listeyi geri döndür
                     if (modified) {
                         param.setResult(newList);
                     }
@@ -118,7 +116,6 @@ public class HideChatsHook {
             try { XposedHelpers.findAndHookMethod(act, classLoader, "onResume", resume); }
             catch (Throwable t) { ModuleLog.line("(IE|HideChats) ⚠️ hook " + act + ": " + t.getMessage()); }
         }
-        ModuleLog.line("(IE|HideChats) ✅ installed");
     }
 
     @SuppressLint("DiscouragedApi")
@@ -232,33 +229,40 @@ public class HideChatsHook {
         }
     }
 
-    // ── thread-id resolution (Öncelik sırası Tracker'a alınarak düzeltildi) ──
+    // ── thread-id resolution (Fragment Manager ile Kesin Tespit) ──
     private String resolveThreadId(Activity activity) {
-        // 1. ÖNCELİK: Canlı Thread Tracker (Ekranda gerçekten aktif olan sohbet)
+        // 1. ÖNCELİK: Aktif (Ekranda Görünen) Fragment Taraması
+        // Eski arka plan sohbetlerini yoksaymak için sadece o an ekranda odaklanan Fragment'ı tarar.
+        try {
+            java.lang.reflect.Method getFm = activity.getClass().getMethod("getSupportFragmentManager");
+            Object fm = getFm.invoke(activity);
+            java.util.List<?> fragments = (java.util.List<?>) fm.getClass().getMethod("getFragments").invoke(fm);
+            
+            if (fragments != null) {
+                // Listeyi sondan başa (en üstte görünen ekrandan geriye) doğru tarıyoruz
+                for (int i = fragments.size() - 1; i >= 0; i--) {
+                    Object f = fragments.get(i);
+                    // Sadece ekranda aktif (isResumed) olan sohbetin ID'sine bakar
+                    if (f != null && Boolean.TRUE.equals(f.getClass().getMethod("isResumed").invoke(f))) {
+                        Object dtk = scan(f, 0, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()), 7);
+                        String id = dtk != null ? firstStringField(dtk) : null;
+                        if (id != null) {
+                            ModuleLog.line("(IE|HideChats) id via active fragment scan");
+                            return id;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        // 2. Canlı Thread Tracker (Eğer üstteki yöntem başarısız olursa)
         String t = trackedVisibleId;
         if (t != null) { ModuleLog.line("(IE|HideChats) id via thread tracker"); return t; }
         
         t = KeepUnsentMessagesHook.currentThreadId;
         if (t != null) { ModuleLog.line("(IE|HideChats) id via KeepUnsent tracker"); return t; }
 
-        // 2. Intent extras (Backstack sorunu yüzünden 2. plana atıldı)
-        try {
-            android.os.Bundle ex = activity.getIntent() != null ? activity.getIntent().getExtras() : null;
-            if (ex != null) {
-                for (String k : ex.keySet()) {
-                    Object dtk = scan(ex.get(k), 0,
-                            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()), 4);
-                    if (dtk != null) { String id = firstStringField(dtk); if (id != null) return id; }
-                }
-            }
-            // 3. Activity object graph
-            Object dtk = scan(activity, 0,
-                    java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()), 6);
-            String id = dtk != null ? firstStringField(dtk) : null;
-            if (id != null) { ModuleLog.line("(IE|HideChats) id via object-graph scan"); return id; }
-        } catch (Throwable ignored) {}
-
-        // 4. Wider object-graph scan
+        // 3. Activity Graph Scan (En son çare, eski arkaplan sohbetlerini bulma riski var)
         try {
             int[] budget = new int[]{6000};
             Object dtk = scanWide(activity, 0,
@@ -267,12 +271,7 @@ public class HideChatsHook {
             if (id != null) { ModuleLog.line("(IE|HideChats) id via wide scan"); return id; }
         } catch (Throwable ignored) {}
 
-        // 5. Last resort
-        t = trackedAnyId;
-        if (t != null) { ModuleLog.line("(IE|HideChats) id via last thread event"); return t; }
-        
-        ModuleLog.line("(IE|HideChats) ⚠️ could not identify thread (tracker events seen: " + trackerEvents + ")");
-        return null;
+        return trackedAnyId;
     }
 
     // ── open-thread tracker ────────────────────────────────────────────────────
@@ -301,10 +300,7 @@ public class HideChatsHook {
                 try { XposedBridge.hookMethod(md.getMethodInstance(classLoader), hook); n++; }
                 catch (Throwable ignored) {}
             }
-            ModuleLog.line("(IE|HideChats) thread tracker hooked " + n + " method(s)");
-        } catch (Throwable t) {
-            ModuleLog.line("(IE|HideChats) ⚠️ thread tracker: " + t.getMessage());
-        }
+        } catch (Throwable ignored) {}
     }
 
     private static Object scanWide(Object obj, int depth, java.util.Set<Object> seen, int maxDepth, int[] budget) {
