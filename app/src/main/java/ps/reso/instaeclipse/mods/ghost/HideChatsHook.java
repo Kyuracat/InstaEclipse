@@ -50,6 +50,7 @@ public class HideChatsHook {
     public void install(DexKitBridge bridge, ClassLoader classLoader) {
         installInboxFilter(bridge, classLoader);
         installHeaderButton(classLoader);
+        installThreadTracker(bridge, classLoader);
     }
 
     // ── 1. Inbox thread-list filter ────────────────────────────────────────────
@@ -58,7 +59,7 @@ public class HideChatsHook {
             @Override protected void afterHookedMethod(MethodHookParam param) {
                 if (!FeatureFlags.hideSpecificChats || HiddenThreads.isEmpty()) return;
                 Object r = param.getResult();
-                if (!(r instanceof java.util.List<?> list) || list.isEmpty()) return;
+                if (!(r instanceof java.util.List) || ((java.util.List<?>) r).isEmpty()) return;
                 try {
                     java.util.Iterator<?> it = ((java.util.List<?>) r).iterator();
                     while (it.hasNext()) {
@@ -98,6 +99,12 @@ public class HideChatsHook {
                 c = c.getSuperclass();
             }
         } catch (Throwable ignored) {}
+        // fallback: the key may sit one or two objects deeper inside the row
+        try {
+            Object dtk = scan(row, 0,
+                    java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>()), 3);
+            if (dtk != null) return firstStringField(dtk);
+        } catch (Throwable ignored) {}
         return null;
     }
 
@@ -107,7 +114,7 @@ public class HideChatsHook {
             @Override protected void afterHookedMethod(MethodHookParam param) {
                 if (!FeatureFlags.hideSpecificChats) return;
                 final Activity a = (Activity) param.thisObject;
-                a.runOnUiThread(() -> registerListener(a));
+                a.runOnUiThread(new Runnable() { @Override public void run() { registerListener(a); } });
             }
         };
         for (String act : new String[]{"com.instagram.modal.ModalActivity",
@@ -178,17 +185,20 @@ public class HideChatsHook {
             lp.gravity = Gravity.CENTER_VERTICAL;
             btn.setLayoutParams(lp);
 
-            btn.setOnClickListener(v -> {
-                String threadId = resolveThreadId(activity);
-                if (threadId == null) {
-                    Toast.makeText(activity, I18n(activity, R.string.ig_hide_chat_no_thread), Toast.LENGTH_SHORT).show();
-                    return;
+            final Activity act2 = activity;
+            btn.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    String threadId = resolveThreadId(act2);
+                    if (threadId == null) {
+                        Toast.makeText(act2, I18n(act2, R.string.ig_hide_chat_no_thread), Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    boolean nowHidden = HiddenThreads.toggle(threadId, threadTitle(act2));
+                    Toast.makeText(act2,
+                            I18n(act2, nowHidden ? R.string.ig_hide_chat_hidden : R.string.ig_hide_chat_unhidden),
+                            Toast.LENGTH_SHORT).show();
+                    ModuleLog.line("(IE|HideChats) toggled thread=" + threadId + " hidden=" + nowHidden);
                 }
-                boolean nowHidden = HiddenThreads.toggle(threadId, threadTitle(activity));
-                Toast.makeText(activity,
-                        I18n(activity, nowHidden ? R.string.ig_hide_chat_hidden : R.string.ig_hide_chat_unhidden),
-                        Toast.LENGTH_SHORT).show();
-                ModuleLog.line("(IE|HideChats) toggled thread=" + threadId + " hidden=" + nowHidden);
             });
             try { target.addView(btn, Math.min(insertAt, target.getChildCount())); }
             catch (Throwable t) { target.addView(btn); }
@@ -246,12 +256,132 @@ public class HideChatsHook {
             // 2. Activity object graph (hosted thread fragment holds the key); depth 6.
             Object dtk = scan(activity, 0,
                     java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()), 6);
-            return dtk != null ? firstStringField(dtk) : null;
-        } catch (Throwable t) { return null; }
+            String id = dtk != null ? firstStringField(dtk) : null;
+            if (id != null) { ModuleLog.line("(IE|HideChats) id via object-graph scan"); return id; }
+        } catch (Throwable t) { /* fall through to the other strategies */ }
+
+        // 3. Open-thread tracker (hooked "igThreadIgid" (DirectThreadKey, boolean) -> void).
+        String t = trackedVisibleId;
+        if (t != null) { ModuleLog.line("(IE|HideChats) id via thread tracker"); return t; }
+        t = KeepUnsentMessagesHook.currentThreadId;
+        if (t != null) { ModuleLog.line("(IE|HideChats) id via KeepUnsent tracker"); return t; }
+
+        // 4. Wider object-graph scan (also walks androidx/fragment internals, collections, arrays).
+        try {
+            int[] budget = new int[]{6000};
+            Object dtk = scanWide(activity, 0,
+                    java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>()), 8, budget);
+            String id = dtk != null ? firstStringField(dtk) : null;
+            if (id != null) { ModuleLog.line("(IE|HideChats) id via wide scan"); return id; }
+        } catch (Throwable ignored) {}
+
+        // 5. Last resort: the most recent thread event, whatever its flag.
+        t = trackedAnyId;
+        if (t != null) { ModuleLog.line("(IE|HideChats) id via last thread event"); return t; }
+        ModuleLog.line("(IE|HideChats) ⚠️ could not identify thread (tracker events seen: " + trackerEvents + ")");
+        return null;
+    }
+
+    // ── open-thread tracker ────────────────────────────────────────────────────
+    private static volatile String trackedVisibleId, trackedAnyId;
+    private static volatile int trackerEvents;
+
+    private void installThreadTracker(DexKitBridge bridge, ClassLoader classLoader) {
+        try {
+            XC_MethodHook hook = new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.args == null || param.args.length == 0) return;
+                        String id = firstStringField(param.args[0]);
+                        if (id == null) return;
+                        trackerEvents++;
+                        trackedAnyId = id;
+                        if (param.args.length > 1 && Boolean.TRUE.equals(param.args[1])) trackedVisibleId = id;
+                    } catch (Throwable ignored) {}
+                }
+            };
+            int n = 0;
+            for (MethodData md : bridge.findMethod(FindMethod.create()
+                    .matcher(MethodMatcher.create()
+                            .usingStrings("igThreadIgid")
+                            .paramTypes("com.instagram.model.direct.DirectThreadKey", "boolean")))) {
+                try { XposedBridge.hookMethod(md.getMethodInstance(classLoader), hook); n++; }
+                catch (Throwable ignored) {}
+            }
+            ModuleLog.line("(IE|HideChats) thread tracker hooked " + n + " method(s)");
+        } catch (Throwable t) {
+            ModuleLog.line("(IE|HideChats) ⚠️ thread tracker: " + t.getMessage());
+        }
+    }
+
+    /** Wider scan: descends androidx/X./app classes, collections, maps and arrays (bounded). */
+    private static Object scanWide(Object obj, int depth, java.util.Set<Object> seen, int maxDepth, int[] budget) {
+        if (obj == null || depth > maxDepth || budget[0] <= 0 || !seen.add(obj)) return null;
+        budget[0]--;
+        Class<?> oc = obj.getClass();
+        String cn = oc.getName();
+        if (cn.contains("DirectThreadKey")) return obj;
+        if (cn.startsWith("android.") && !(obj instanceof android.os.Bundle)) return null;
+        if (cn.startsWith("java.") && !(obj instanceof java.util.Collection) && !(obj instanceof java.util.Map)
+                && !oc.isArray()) return null;
+        if (cn.startsWith("kotlin.") || cn.startsWith("dalvik.") || cn.startsWith("libcore.")
+                || cn.startsWith("com.android.") || cn.startsWith("javax.")) return null;
+        try {
+            if (obj instanceof android.os.Bundle) {
+                android.os.Bundle b = (android.os.Bundle) obj;
+                for (String k : b.keySet()) {
+                    Object r = scanWide(b.get(k), depth + 1, seen, maxDepth, budget);
+                    if (r != null) return r;
+                }
+                return null;
+            }
+            if (obj instanceof java.util.Collection) {
+                int i = 0;
+                for (Object e : (java.util.Collection<?>) obj) {
+                    if (i++ > 60) break;
+                    Object r = scanWide(e, depth + 1, seen, maxDepth, budget);
+                    if (r != null) return r;
+                }
+                return null;
+            }
+            if (obj instanceof java.util.Map) {
+                int i = 0;
+                for (Object e : ((java.util.Map<?, ?>) obj).values()) {
+                    if (i++ > 60) break;
+                    Object r = scanWide(e, depth + 1, seen, maxDepth, budget);
+                    if (r != null) return r;
+                }
+                return null;
+            }
+            if (oc.isArray()) {
+                if (oc.getComponentType().isPrimitive()) return null;
+                Object[] arr = (Object[]) obj;
+                for (int i = 0; i < arr.length && i < 60; i++) {
+                    Object r = scanWide(arr[i], depth + 1, seen, maxDepth, budget);
+                    if (r != null) return r;
+                }
+                return null;
+            }
+            for (Class<?> c = oc; c != null && c != Object.class; c = c.getSuperclass()) {
+                String ccn = c.getName();
+                if (ccn.startsWith("android.") || ccn.startsWith("java.")) break; // framework base classes
+                for (Field f : c.getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
+                    f.setAccessible(true);
+                    Object v;
+                    try { v = f.get(obj); } catch (Throwable e) { continue; }
+                    if (v == null) continue;
+                    if (v.getClass().getName().contains("DirectThreadKey")) return v;
+                    Object r = scanWide(v, depth + 1, seen, maxDepth, budget);
+                    if (r != null) return r;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     /** Find a DirectThreadKey in obj's field graph (depth-limited; descends IG/obfuscated + Bundles). */
-    private Object scan(Object obj, int depth, java.util.Set<Object> seen, int maxDepth) {
+    private static Object scan(Object obj, int depth, java.util.Set<Object> seen, int maxDepth) {
         if (obj == null || depth > maxDepth || !seen.add(obj)) return null;
         String cn = obj.getClass().getName();
         if (cn.contains("DirectThreadKey")) return obj;
@@ -292,7 +422,7 @@ public class HideChatsHook {
                 if (f.getType() != String.class) continue;
                 f.setAccessible(true);
                 Object v = f.get(o);
-                if (v instanceof String s && !s.isEmpty()) return s;
+                if (v instanceof String && !((String) v).isEmpty()) return (String) v;
             }
         } catch (Throwable ignored) {}
         return null;
