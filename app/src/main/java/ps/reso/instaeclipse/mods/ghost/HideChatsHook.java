@@ -95,7 +95,7 @@ public class HideChatsHook {
             }
         } catch (Throwable ignored) {}
         try {
-            Object dtk = scan(row, 0,
+            Object dtk = scanForInbox(row, 0,
                     java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>()), 3);
             if (dtk != null) return firstStringField(dtk);
         } catch (Throwable ignored) {}
@@ -229,54 +229,64 @@ public class HideChatsHook {
         }
     }
 
-    // ── thread-id resolution (Fragment Manager ile Kesin Tespit) ──
+    // ── thread-id resolution (Optimize Edilmiş, Gecikmesiz Yöntem) ──
     private String resolveThreadId(Activity activity) {
-        // 1. ÖNCELİK: Aktif (Ekranda Görünen) Fragment Taraması
-        // Eski arka plan sohbetlerini yoksaymak için sadece o an ekranda odaklanan Fragment'ı tarar.
+        // 1. ÖNCELİK: Canlı Tracker (Derin tarama yapmaz, %100 anlık veriyi verir)
+        if (trackedVisibleId != null) {
+            ModuleLog.line("(IE|HideChats) id via thread tracker");
+            return trackedVisibleId;
+        }
+        
+        if (KeepUnsentMessagesHook.currentThreadId != null) {
+            ModuleLog.line("(IE|HideChats) id via KeepUnsent tracker");
+            return KeepUnsentMessagesHook.currentThreadId;
+        }
+
+        // 2. ÖNCELİK: Sadece aktif Fragment'ın saf Bundle verisine bakar (Gecikme yaratmaz)
         try {
             java.lang.reflect.Method getFm = activity.getClass().getMethod("getSupportFragmentManager");
             Object fm = getFm.invoke(activity);
             java.util.List<?> fragments = (java.util.List<?>) fm.getClass().getMethod("getFragments").invoke(fm);
-            
             if (fragments != null) {
-                // Listeyi sondan başa (en üstte görünen ekrandan geriye) doğru tarıyoruz
                 for (int i = fragments.size() - 1; i >= 0; i--) {
                     Object f = fragments.get(i);
-                    // Sadece ekranda aktif (isResumed) olan sohbetin ID'sine bakar
                     if (f != null && Boolean.TRUE.equals(f.getClass().getMethod("isResumed").invoke(f))) {
-                        Object dtk = scan(f, 0, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()), 7);
-                        String id = dtk != null ? firstStringField(dtk) : null;
-                        if (id != null) {
-                            ModuleLog.line("(IE|HideChats) id via active fragment scan");
-                            return id;
+                        Object args = f.getClass().getMethod("getArguments").invoke(f);
+                        if (args instanceof android.os.Bundle) {
+                            String id = extractIdFromBundle((android.os.Bundle) args);
+                            if (id != null) return id;
                         }
                     }
                 }
             }
         } catch (Throwable ignored) {}
 
-        // 2. Canlı Thread Tracker (Eğer üstteki yöntem başarısız olursa)
-        String t = trackedVisibleId;
-        if (t != null) { ModuleLog.line("(IE|HideChats) id via thread tracker"); return t; }
-        
-        t = KeepUnsentMessagesHook.currentThreadId;
-        if (t != null) { ModuleLog.line("(IE|HideChats) id via KeepUnsent tracker"); return t; }
-
-        // 3. Activity Graph Scan (En son çare, eski arkaplan sohbetlerini bulma riski var)
+        // 3. ÖNCELİK: Intent Extras
         try {
-            int[] budget = new int[]{6000};
-            Object dtk = scanWide(activity, 0,
-                    java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>()), 8, budget);
-            String id = dtk != null ? firstStringField(dtk) : null;
-            if (id != null) { ModuleLog.line("(IE|HideChats) id via wide scan"); return id; }
+            if (activity.getIntent() != null && activity.getIntent().getExtras() != null) {
+                String id = extractIdFromBundle(activity.getIntent().getExtras());
+                if (id != null) return id;
+            }
         } catch (Throwable ignored) {}
 
         return trackedAnyId;
     }
 
+    private String extractIdFromBundle(android.os.Bundle b) {
+        if (b == null) return null;
+        try {
+            for (String k : b.keySet()) {
+                Object val = b.get(k);
+                if (val != null && val.getClass().getName().contains("DirectThreadKey")) {
+                    return firstStringField(val);
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
     // ── open-thread tracker ────────────────────────────────────────────────────
     private static volatile String trackedVisibleId, trackedAnyId;
-    private static volatile int trackerEvents;
 
     private void installThreadTracker(DexKitBridge bridge, ClassLoader classLoader) {
         try {
@@ -286,7 +296,6 @@ public class HideChatsHook {
                         if (param.args == null || param.args.length == 0) return;
                         String id = firstStringField(param.args[0]);
                         if (id == null) return;
-                        trackerEvents++;
                         trackedAnyId = id;
                         if (param.args.length > 1 && Boolean.TRUE.equals(param.args[1])) trackedVisibleId = id;
                     } catch (Throwable ignored) {}
@@ -303,83 +312,18 @@ public class HideChatsHook {
         } catch (Throwable ignored) {}
     }
 
-    private static Object scanWide(Object obj, int depth, java.util.Set<Object> seen, int maxDepth, int[] budget) {
-        if (obj == null || depth > maxDepth || budget[0] <= 0 || !seen.add(obj)) return null;
-        budget[0]--;
-        Class<?> oc = obj.getClass();
-        String cn = oc.getName();
-        if (cn.contains("DirectThreadKey")) return obj;
-        if (cn.startsWith("android.") && !(obj instanceof android.os.Bundle)) return null;
-        if (cn.startsWith("java.") && !(obj instanceof java.util.Collection) && !(obj instanceof java.util.Map)
-                && !oc.isArray()) return null;
-        if (cn.startsWith("kotlin.") || cn.startsWith("dalvik.") || cn.startsWith("libcore.")
-                || cn.startsWith("com.android.") || cn.startsWith("javax.")) return null;
-        try {
-            if (obj instanceof android.os.Bundle) {
-                android.os.Bundle b = (android.os.Bundle) obj;
-                for (String k : b.keySet()) {
-                    Object r = scanWide(b.get(k), depth + 1, seen, maxDepth, budget);
-                    if (r != null) return r;
-                }
-                return null;
-            }
-            if (obj instanceof java.util.Collection) {
-                int i = 0;
-                for (Object e : (java.util.Collection<?>) obj) {
-                    if (i++ > 60) break;
-                    Object r = scanWide(e, depth + 1, seen, maxDepth, budget);
-                    if (r != null) return r;
-                }
-                return null;
-            }
-            if (obj instanceof java.util.Map) {
-                int i = 0;
-                for (Object e : ((java.util.Map<?, ?>) obj).values()) {
-                    if (i++ > 60) break;
-                    Object r = scanWide(e, depth + 1, seen, maxDepth, budget);
-                    if (r != null) return r;
-                }
-                return null;
-            }
-            if (oc.isArray()) {
-                if (oc.getComponentType().isPrimitive()) return null;
-                Object[] arr = (Object[]) obj;
-                for (int i = 0; i < arr.length && i < 60; i++) {
-                    Object r = scanWide(arr[i], depth + 1, seen, maxDepth, budget);
-                    if (r != null) return r;
-                }
-                return null;
-            }
-            for (Class<?> c = oc; c != null && c != Object.class; c = c.getSuperclass()) {
-                String ccn = c.getName();
-                if (ccn.startsWith("android.") || ccn.startsWith("java.")) break;
-                for (Field f : c.getDeclaredFields()) {
-                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
-                    f.setAccessible(true);
-                    Object v;
-                    try { v = f.get(obj); } catch (Throwable e) { continue; }
-                    if (v == null) continue;
-                    if (v.getClass().getName().contains("DirectThreadKey")) return v;
-                    Object r = scanWide(v, depth + 1, seen, maxDepth, budget);
-                    if (r != null) return r;
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    private static Object scan(Object obj, int depth, java.util.Set<Object> seen, int maxDepth) {
+    // Inbox objeleri için hafifletilmiş, performans dostu tarayıcı (Gecikme yapmaz)
+    private static Object scanForInbox(Object obj, int depth, java.util.Set<Object> seen, int maxDepth) {
         if (obj == null || depth > maxDepth || !seen.add(obj)) return null;
         String cn = obj.getClass().getName();
         if (cn.contains("DirectThreadKey")) return obj;
-        boolean descendable = cn.startsWith("X.") || cn.startsWith("com.instagram.")
-                || obj instanceof android.os.Bundle;
+        boolean descendable = cn.startsWith("X.") || cn.startsWith("com.instagram.") || obj instanceof android.os.Bundle;
         if (!descendable) return null;
         if (obj instanceof android.os.Bundle) {
             try {
                 android.os.Bundle b = (android.os.Bundle) obj;
                 for (String k : b.keySet()) {
-                    Object r = scan(b.get(k), depth + 1, seen, maxDepth);
+                    Object r = scanForInbox(b.get(k), depth + 1, seen, maxDepth);
                     if (r != null) return r;
                 }
             } catch (Throwable ignored) {}
@@ -394,7 +338,7 @@ public class HideChatsHook {
                     try { v = f.get(obj); } catch (Throwable e) { continue; }
                     if (v == null) continue;
                     if (v.getClass().getName().contains("DirectThreadKey")) return v;
-                    Object r = scan(v, depth + 1, seen, maxDepth);
+                    Object r = scanForInbox(v, depth + 1, seen, maxDepth);
                     if (r != null) return r;
                 }
             }
